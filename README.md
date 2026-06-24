@@ -97,6 +97,42 @@ as `READY`, and retries it after 10 seconds:
 
 For the MVP, deliveries retry after 10 seconds and fail after 5 NACK attempts.
 
+## Dead Letter Queue
+
+After 5 failed attempts, the broker stops retrying a delivery and moves it to
+the dead letter queue.
+
+A DLQ record stores:
+
+```json
+{"delivery_id":"delivery_...","message_id":"msg_...","topic":"order.created","queue":"notification-service","payload":{"orderId":"ord_001"},"attempts":5,"last_error":"email provider unavailable","failed_at":"..."}
+```
+
+Replay a dead letter delivery later:
+
+```json
+{"type":"REPLAY_DLQ","delivery_id":"delivery_..."}
+```
+
+The broker removes it from the DLQ, resets it to `READY`, and tries to deliver
+it again:
+
+```json
+{"type":"DLQ_REPLAYED","delivery_id":"delivery_...","message_id":"msg_...","topic":"order.created","queue":"notification-service","status":"READY"}
+```
+
+## Delivery engine
+
+The broker runs a background delivery engine every 1 second.
+
+The engine:
+
+- scans queues for `READY` deliveries
+- checks whether delayed retries are now available
+- sends each delivery to an active consumer in the delivery's queue
+- marks sent deliveries as `IN_FLIGHT`
+- requeues stuck `IN_FLIGHT` deliveries after a 30 second ACK timeout
+
 ## Consumer disconnects
 
 If a consumer disconnects while it owns an `IN_FLIGHT` delivery, the broker
@@ -104,3 +140,6 @@ marks that delivery as `READY` again and tries to send it to another active
 consumer in the same queue.
 
 That means a worker can crash before sending `ACK`, and the message is not lost.
+
+The same protection applies when a consumer stays connected but never sends
+`ACK` or `NACK`: after 30 seconds, the delivery becomes retryable again.

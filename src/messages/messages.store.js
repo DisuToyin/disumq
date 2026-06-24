@@ -4,6 +4,7 @@ const messages = new Map();
 const messagesByTopic = new Map();
 const deliveries = new Map();
 const deliveriesByQueue = new Map();
+const deadLetterDeliveries = new Map();
 
 const DELIVERY_STATUS = {
   READY: "READY",
@@ -14,6 +15,7 @@ const DELIVERY_STATUS = {
 
 const MAX_DELIVERY_ATTEMPTS = 5;
 const RETRY_DELAY_MS = 10_000;
+const ACK_TIMEOUT_MS = 30_000;
 
 function getTopicMessages(topic) {
   if (!messagesByTopic.has(topic)) {
@@ -69,6 +71,7 @@ function createDelivery(message, queueName) {
     nackedAt: null,
     failedAt: null,
     nextRetryAt: null,
+    lastError: null,
   };
 
   deliveries.set(delivery.id, delivery);
@@ -94,6 +97,17 @@ function markDeliveryInFlight(deliveryId, client) {
   delivery.deliveredAt = new Date().toISOString();
   delivery.deliveredConnectionId = client.connectionId;
   delivery.deliveredTo = client.clientId;
+  delivery.nextRetryAt = null;
+
+  return delivery;
+}
+
+function setDeliveryDeliveredAt(deliveryId, deliveredAt) {
+  const delivery = deliveries.get(deliveryId);
+
+  if (!delivery) return null;
+
+  delivery.deliveredAt = deliveredAt;
 
   return delivery;
 }
@@ -125,6 +139,7 @@ function ackDelivery(deliveryId, connectionId) {
   delivery.status = DELIVERY_STATUS.ACKED;
   delivery.ackedAt = new Date().toISOString();
   delivery.nextRetryAt = null;
+  delivery.lastError = null;
 
   return {
     ok: true,
@@ -132,7 +147,7 @@ function ackDelivery(deliveryId, connectionId) {
   };
 }
 
-function nackDelivery(deliveryId, connectionId) {
+function nackDelivery(deliveryId, connectionId, options = {}) {
   const delivery = deliveries.get(deliveryId);
 
   if (!delivery) {
@@ -156,31 +171,15 @@ function nackDelivery(deliveryId, connectionId) {
     };
   }
 
-  delivery.attempts += 1;
   delivery.nackedAt = new Date().toISOString();
-  delivery.deliveredAt = null;
-  delivery.deliveredConnectionId = null;
-  delivery.deliveredTo = null;
-
-  if (delivery.attempts >= MAX_DELIVERY_ATTEMPTS) {
-    delivery.status = DELIVERY_STATUS.FAILED;
-    delivery.failedAt = new Date().toISOString();
-    delivery.nextRetryAt = null;
-
-    return {
-      ok: true,
-      delivery,
-      retry: false,
-    };
-  }
-
-  delivery.status = DELIVERY_STATUS.READY;
-  delivery.nextRetryAt = new Date(Date.now() + RETRY_DELAY_MS).toISOString();
+  const result = retryDelivery(delivery, {
+    lastError: options.lastError || "Consumer NACKed delivery",
+  });
 
   return {
     ok: true,
     delivery,
-    retry: true,
+    retry: result.retry,
     retryDelayMs: RETRY_DELAY_MS,
   };
 }
@@ -199,6 +198,101 @@ function getReadyDeliveries(queueName, now = new Date()) {
 
       return new Date(delivery.nextRetryAt) <= now;
     });
+}
+
+function getQueueNamesWithDeliveries() {
+  return Array.from(deliveriesByQueue.keys());
+}
+
+function createDeadLetterDelivery(delivery) {
+  const message = messages.get(delivery.messageId);
+
+  const deadLetterDelivery = {
+    delivery_id: delivery.id,
+    message_id: delivery.messageId,
+    topic: delivery.topic,
+    queue: delivery.queue,
+    payload: message ? message.payload : null,
+    attempts: delivery.attempts,
+    last_error: delivery.lastError,
+    failed_at: delivery.failedAt,
+  };
+
+  deadLetterDeliveries.set(delivery.id, deadLetterDelivery);
+
+  return deadLetterDelivery;
+}
+
+function retryDelivery(delivery, options = {}) {
+  const retryDelayMs =
+    options.retryDelayMs === undefined ? RETRY_DELAY_MS : options.retryDelayMs;
+  const lastError = options.lastError || "Delivery failed";
+
+  delivery.attempts += 1;
+  delivery.deliveredAt = null;
+  delivery.deliveredConnectionId = null;
+  delivery.deliveredTo = null;
+  delivery.lastError = lastError;
+
+  if (delivery.attempts >= MAX_DELIVERY_ATTEMPTS) {
+    delivery.status = DELIVERY_STATUS.FAILED;
+    delivery.failedAt = new Date().toISOString();
+    delivery.nextRetryAt = null;
+    createDeadLetterDelivery(delivery);
+
+    return {
+      retry: false,
+      delivery,
+    };
+  }
+
+  delivery.status = DELIVERY_STATUS.READY;
+  delivery.nextRetryAt =
+    retryDelayMs > 0
+      ? new Date(Date.now() + retryDelayMs).toISOString()
+      : null;
+
+  return {
+    retry: true,
+    delivery,
+  };
+}
+
+function requeueTimedOutDeliveries(now = new Date()) {
+  const requeuedDeliveries = [];
+  const failedDeliveries = [];
+
+  for (const delivery of deliveries.values()) {
+    if (
+      delivery.status !== DELIVERY_STATUS.IN_FLIGHT ||
+      !delivery.deliveredAt
+    ) {
+      continue;
+    }
+
+    const deliveredAt = new Date(delivery.deliveredAt);
+    const timedOutAt = new Date(deliveredAt.getTime() + ACK_TIMEOUT_MS);
+
+    if (timedOutAt > now) {
+      continue;
+    }
+
+    const result = retryDelivery(delivery, {
+      retryDelayMs: 0,
+      lastError: "ACK timeout",
+    });
+
+    if (result.retry) {
+      requeuedDeliveries.push(delivery);
+    } else {
+      failedDeliveries.push(delivery);
+    }
+  }
+
+  return {
+    requeuedDeliveries,
+    failedDeliveries,
+  };
 }
 
 function requeueInFlightDeliveriesForConnection(connectionId) {
@@ -229,19 +323,60 @@ function getQueueDeliveryDepth(queueName) {
   return getQueueDeliveries(queueName).length;
 }
 
+function getDeadLetterDelivery(deliveryId) {
+  return deadLetterDeliveries.get(deliveryId);
+}
+
+function replayDeadLetterDelivery(deliveryId) {
+  const deadLetterDelivery = deadLetterDeliveries.get(deliveryId);
+  const delivery = deliveries.get(deliveryId);
+
+  if (!deadLetterDelivery || !delivery) {
+    return {
+      ok: false,
+      error: "Dead letter delivery not found",
+    };
+  }
+
+  delivery.status = DELIVERY_STATUS.READY;
+  delivery.attempts = 0;
+  delivery.deliveredAt = null;
+  delivery.deliveredConnectionId = null;
+  delivery.deliveredTo = null;
+  delivery.ackedAt = null;
+  delivery.nackedAt = null;
+  delivery.failedAt = null;
+  delivery.nextRetryAt = null;
+  delivery.lastError = null;
+
+  deadLetterDeliveries.delete(deliveryId);
+
+  return {
+    ok: true,
+    delivery,
+    deadLetterDelivery,
+  };
+}
+
 module.exports = {
   DELIVERY_STATUS,
   MAX_DELIVERY_ATTEMPTS,
   RETRY_DELAY_MS,
+  ACK_TIMEOUT_MS,
   publishMessage,
   createDelivery,
   getMessage,
   getDelivery,
   markDeliveryInFlight,
+  setDeliveryDeliveredAt,
   ackDelivery,
   nackDelivery,
   getReadyDeliveries,
+  getQueueNamesWithDeliveries,
+  requeueTimedOutDeliveries,
   requeueInFlightDeliveriesForConnection,
+  getDeadLetterDelivery,
+  replayDeadLetterDelivery,
   getTopicDepth,
   getQueueDeliveryDepth,
 };

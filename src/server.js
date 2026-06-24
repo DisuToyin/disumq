@@ -15,6 +15,7 @@ const { send } = require("./utils/response");
 const {
   removeClientFromSubscriptions,
 } = require("./subscriptions/subscriptions.store");
+const { startDeliveryEngine } = require("./delivery/delivery.engine");
 
 const PORT = 7070;
 const HOST = "127.0.0.1";
@@ -84,5 +85,6 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(PORT, HOST, () => {
+  startDeliveryEngine();
   console.log(`TCP broker running on ${HOST}:${PORT}`);
 });

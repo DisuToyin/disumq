@@ -10,6 +10,7 @@ const {
   publishMessage,
   ackDelivery,
   nackDelivery,
+  replayDeadLetterDelivery,
 } = require("../messages/messages.store");
 const {
   subscribeClient,
@@ -162,6 +163,10 @@ function getDeliveryId(command) {
   return command.delivery_id || command.deliveryId;
 }
 
+function getCommandError(command) {
+  return command.error || command.reason || command.last_error || null;
+}
+
 function handleAck(socket, connectionId, client, command) {
   const deliveryId = getDeliveryId(command);
 
@@ -199,16 +204,6 @@ function handleAck(socket, connectionId, client, command) {
   dispatchReadyDeliveries(result.delivery.queue);
 }
 
-function scheduleRetry(queue, retryDelayMs) {
-  const retryTimer = setTimeout(() => {
-    dispatchReadyDeliveries(queue);
-  }, retryDelayMs);
-
-  if (retryTimer.unref) {
-    retryTimer.unref();
-  }
-}
-
 function handleNack(socket, connectionId, client, command) {
   const deliveryId = getDeliveryId(command);
 
@@ -226,17 +221,15 @@ function handleNack(socket, connectionId, client, command) {
     });
   }
 
-  const result = nackDelivery(deliveryId, connectionId);
+  const result = nackDelivery(deliveryId, connectionId, {
+    lastError: getCommandError(command),
+  });
 
   if (!result.ok) {
     return send(socket, {
       type: "ERROR",
       message: result.error,
     });
-  }
-
-  if (result.retry) {
-    scheduleRetry(result.delivery.queue, result.retryDelayMs);
   }
 
   return send(socket, {
@@ -249,6 +242,37 @@ function handleNack(socket, connectionId, client, command) {
     retry: result.retry,
     next_retry_at: result.delivery.nextRetryAt,
   });
+}
+
+function handleReplayDlq(socket, command) {
+  const deliveryId = getDeliveryId(command);
+
+  if (!deliveryId) {
+    return send(socket, {
+      type: "ERROR",
+      message: "REPLAY_DLQ requires delivery_id",
+    });
+  }
+
+  const result = replayDeadLetterDelivery(deliveryId);
+
+  if (!result.ok) {
+    return send(socket, {
+      type: "ERROR",
+      message: result.error,
+    });
+  }
+
+  send(socket, {
+    type: "DLQ_REPLAYED",
+    delivery_id: result.delivery.id,
+    message_id: result.delivery.messageId,
+    topic: result.delivery.topic,
+    queue: result.delivery.queue,
+    status: result.delivery.status,
+  });
+
+  dispatchReadyDeliveries(result.delivery.queue);
 }
 
 function handleCommand(socket, connectionId, command) {
@@ -308,6 +332,10 @@ function handleCommand(socket, connectionId, command) {
 
     case "NACK": {
       return handleNack(socket, connectionId, client, command);
+    }
+
+    case "REPLAY_DLQ": {
+      return handleReplayDlq(socket, command);
     }
 
     default: {
