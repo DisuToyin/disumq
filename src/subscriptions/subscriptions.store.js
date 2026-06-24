@@ -1,4 +1,10 @@
 const { getClient } = require("../clients/clients.store");
+const {
+  all,
+  ensureQueue,
+  ensureTopic,
+  run,
+} = require("../db/sqlite");
 const { send } = require("../utils/response");
 const {
   createDelivery,
@@ -32,6 +38,8 @@ function getQueue(queueName) {
 }
 
 function subscribeClient(topic, queueName, connectionId) {
+  persistTopicBinding(topic, queueName);
+
   const topicQueues = getTopicQueues(topic);
   const queue = getQueue(queueName);
 
@@ -45,6 +53,23 @@ function subscribeClient(topic, queueName, connectionId) {
     queueCount: topicQueues.size,
     subscriberCount: queue.subscribers.length,
   };
+}
+
+function persistTopicBinding(topic, queueName) {
+  ensureTopic(topic);
+  ensureQueue(queueName);
+
+  run(
+    `
+      INSERT OR IGNORE INTO topic_bindings (topic, queue, created_at)
+      VALUES (:topic, :queue, :created_at)
+    `,
+    {
+      topic,
+      queue: queueName,
+      created_at: new Date().toISOString(),
+    }
+  );
 }
 
 function removeClientFromSubscriptions(connectionId) {
@@ -171,6 +196,21 @@ function routeMessageToQueues(topic, message) {
     };
   });
 }
+
+function hydrateTopicBindings() {
+  const rows = all(`
+    SELECT topic, queue
+    FROM topic_bindings
+    ORDER BY created_at ASC
+  `);
+
+  for (const row of rows) {
+    getTopicQueues(row.topic).add(row.queue);
+    getQueue(row.queue);
+  }
+}
+
+hydrateTopicBindings();
 
 module.exports = {
   subscribeClient,

@@ -1,4 +1,10 @@
 const crypto = require("crypto");
+const {
+  all,
+  ensureQueue,
+  ensureTopic,
+  run,
+} = require("../db/sqlite");
 
 const messages = new Map();
 const messagesByTopic = new Map();
@@ -16,6 +22,14 @@ const DELIVERY_STATUS = {
 const MAX_DELIVERY_ATTEMPTS = 5;
 const RETRY_DELAY_MS = 10_000;
 const ACK_TIMEOUT_MS = 30_000;
+
+function serializePayload(payload) {
+  return JSON.stringify(payload);
+}
+
+function deserializePayload(payloadJson) {
+  return JSON.parse(payloadJson);
+}
 
 function getTopicMessages(topic) {
   if (!messagesByTopic.has(topic)) {
@@ -35,6 +49,7 @@ function getQueueDeliveries(queueName) {
 
 function publishMessage(topic, payload, producerId) {
   const now = new Date().toISOString();
+  ensureTopic(topic);
 
   const message = {
     id: `msg_${crypto.randomUUID()}`,
@@ -46,6 +61,7 @@ function publishMessage(topic, payload, producerId) {
 
   messages.set(message.id, message);
   getTopicMessages(topic).push(message.id);
+  persistMessage(message);
 
   return {
     message,
@@ -55,6 +71,8 @@ function publishMessage(topic, payload, producerId) {
 
 function createDelivery(message, queueName) {
   const now = new Date().toISOString();
+  ensureTopic(message.topic);
+  ensureQueue(queueName);
 
   const delivery = {
     id: `delivery_${crypto.randomUUID()}`,
@@ -76,6 +94,7 @@ function createDelivery(message, queueName) {
 
   deliveries.set(delivery.id, delivery);
   getQueueDeliveries(queueName).push(delivery.id);
+  persistDelivery(delivery);
 
   return delivery;
 }
@@ -98,6 +117,7 @@ function markDeliveryInFlight(deliveryId, client) {
   delivery.deliveredConnectionId = client.connectionId;
   delivery.deliveredTo = client.clientId;
   delivery.nextRetryAt = null;
+  persistDelivery(delivery);
 
   return delivery;
 }
@@ -108,6 +128,7 @@ function setDeliveryDeliveredAt(deliveryId, deliveredAt) {
   if (!delivery) return null;
 
   delivery.deliveredAt = deliveredAt;
+  persistDelivery(delivery);
 
   return delivery;
 }
@@ -140,6 +161,7 @@ function ackDelivery(deliveryId, connectionId) {
   delivery.ackedAt = new Date().toISOString();
   delivery.nextRetryAt = null;
   delivery.lastError = null;
+  persistDelivery(delivery);
 
   return {
     ok: true,
@@ -219,6 +241,7 @@ function createDeadLetterDelivery(delivery) {
   };
 
   deadLetterDeliveries.set(delivery.id, deadLetterDelivery);
+  persistDeadLetterDelivery(deadLetterDelivery);
 
   return deadLetterDelivery;
 }
@@ -239,6 +262,7 @@ function retryDelivery(delivery, options = {}) {
     delivery.failedAt = new Date().toISOString();
     delivery.nextRetryAt = null;
     createDeadLetterDelivery(delivery);
+    persistDelivery(delivery);
 
     return {
       retry: false,
@@ -251,6 +275,7 @@ function retryDelivery(delivery, options = {}) {
     retryDelayMs > 0
       ? new Date(Date.now() + retryDelayMs).toISOString()
       : null;
+  persistDelivery(delivery);
 
   return {
     retry: true,
@@ -309,6 +334,7 @@ function requeueInFlightDeliveriesForConnection(connectionId) {
       delivery.deliveredTo = null;
       delivery.nextRetryAt = null;
       requeuedDeliveries.push(delivery);
+      persistDelivery(delivery);
     }
   }
 
@@ -350,6 +376,8 @@ function replayDeadLetterDelivery(deliveryId) {
   delivery.lastError = null;
 
   deadLetterDeliveries.delete(deliveryId);
+  deleteDeadLetterDelivery(deliveryId);
+  persistDelivery(delivery);
 
   return {
     ok: true,
@@ -357,6 +385,290 @@ function replayDeadLetterDelivery(deliveryId) {
     deadLetterDelivery,
   };
 }
+
+function persistMessage(message) {
+  ensureTopic(message.topic);
+
+  run(
+    `
+      INSERT INTO messages (
+        id,
+        topic,
+        payload_json,
+        producer_id,
+        published_at
+      )
+      VALUES (
+        :id,
+        :topic,
+        :payload_json,
+        :producer_id,
+        :published_at
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        topic = excluded.topic,
+        payload_json = excluded.payload_json,
+        producer_id = excluded.producer_id,
+        published_at = excluded.published_at
+    `,
+    {
+      id: message.id,
+      topic: message.topic,
+      payload_json: serializePayload(message.payload),
+      producer_id: message.producerId,
+      published_at: message.publishedAt,
+    }
+  );
+}
+
+function persistDelivery(delivery) {
+  ensureTopic(delivery.topic);
+  ensureQueue(delivery.queue);
+
+  run(
+    `
+      INSERT INTO deliveries (
+        id,
+        message_id,
+        topic,
+        queue,
+        status,
+        attempts,
+        created_at,
+        delivered_at,
+        delivered_connection_id,
+        delivered_to,
+        acked_at,
+        nacked_at,
+        failed_at,
+        next_retry_at,
+        last_error
+      )
+      VALUES (
+        :id,
+        :message_id,
+        :topic,
+        :queue,
+        :status,
+        :attempts,
+        :created_at,
+        :delivered_at,
+        :delivered_connection_id,
+        :delivered_to,
+        :acked_at,
+        :nacked_at,
+        :failed_at,
+        :next_retry_at,
+        :last_error
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        message_id = excluded.message_id,
+        topic = excluded.topic,
+        queue = excluded.queue,
+        status = excluded.status,
+        attempts = excluded.attempts,
+        created_at = excluded.created_at,
+        delivered_at = excluded.delivered_at,
+        delivered_connection_id = excluded.delivered_connection_id,
+        delivered_to = excluded.delivered_to,
+        acked_at = excluded.acked_at,
+        nacked_at = excluded.nacked_at,
+        failed_at = excluded.failed_at,
+        next_retry_at = excluded.next_retry_at,
+        last_error = excluded.last_error
+    `,
+    {
+      id: delivery.id,
+      message_id: delivery.messageId,
+      topic: delivery.topic,
+      queue: delivery.queue,
+      status: delivery.status,
+      attempts: delivery.attempts,
+      created_at: delivery.createdAt,
+      delivered_at: delivery.deliveredAt,
+      delivered_connection_id: delivery.deliveredConnectionId,
+      delivered_to: delivery.deliveredTo,
+      acked_at: delivery.ackedAt,
+      nacked_at: delivery.nackedAt,
+      failed_at: delivery.failedAt,
+      next_retry_at: delivery.nextRetryAt,
+      last_error: delivery.lastError,
+    }
+  );
+}
+
+function persistDeadLetterDelivery(deadLetterDelivery) {
+  ensureTopic(deadLetterDelivery.topic);
+  ensureQueue(deadLetterDelivery.queue);
+
+  run(
+    `
+      INSERT INTO dead_letter_deliveries (
+        delivery_id,
+        message_id,
+        topic,
+        queue,
+        payload_json,
+        attempts,
+        last_error,
+        failed_at
+      )
+      VALUES (
+        :delivery_id,
+        :message_id,
+        :topic,
+        :queue,
+        :payload_json,
+        :attempts,
+        :last_error,
+        :failed_at
+      )
+      ON CONFLICT(delivery_id) DO UPDATE SET
+        message_id = excluded.message_id,
+        topic = excluded.topic,
+        queue = excluded.queue,
+        payload_json = excluded.payload_json,
+        attempts = excluded.attempts,
+        last_error = excluded.last_error,
+        failed_at = excluded.failed_at
+    `,
+    {
+      delivery_id: deadLetterDelivery.delivery_id,
+      message_id: deadLetterDelivery.message_id,
+      topic: deadLetterDelivery.topic,
+      queue: deadLetterDelivery.queue,
+      payload_json: serializePayload(deadLetterDelivery.payload),
+      attempts: deadLetterDelivery.attempts,
+      last_error: deadLetterDelivery.last_error,
+      failed_at: deadLetterDelivery.failed_at,
+    }
+  );
+}
+
+function deleteDeadLetterDelivery(deliveryId) {
+  run(
+    `
+      DELETE FROM dead_letter_deliveries
+      WHERE delivery_id = :delivery_id
+    `,
+    {
+      delivery_id: deliveryId,
+    }
+  );
+}
+
+function hydrateMessages() {
+  const rows = all(`
+    SELECT id, topic, payload_json, producer_id, published_at
+    FROM messages
+    ORDER BY published_at ASC
+  `);
+
+  for (const row of rows) {
+    const message = {
+      id: row.id,
+      topic: row.topic,
+      payload: deserializePayload(row.payload_json),
+      producerId: row.producer_id,
+      publishedAt: row.published_at,
+    };
+
+    messages.set(message.id, message);
+    getTopicMessages(message.topic).push(message.id);
+  }
+}
+
+function hydrateDeliveries() {
+  const rows = all(`
+    SELECT
+      id,
+      message_id,
+      topic,
+      queue,
+      status,
+      attempts,
+      created_at,
+      delivered_at,
+      delivered_connection_id,
+      delivered_to,
+      acked_at,
+      nacked_at,
+      failed_at,
+      next_retry_at,
+      last_error
+    FROM deliveries
+    ORDER BY created_at ASC
+  `);
+
+  for (const row of rows) {
+    const delivery = {
+      id: row.id,
+      messageId: row.message_id,
+      topic: row.topic,
+      queue: row.queue,
+      status: row.status,
+      attempts: row.attempts,
+      createdAt: row.created_at,
+      deliveredAt: row.delivered_at,
+      deliveredConnectionId: row.delivered_connection_id,
+      deliveredTo: row.delivered_to,
+      ackedAt: row.acked_at,
+      nackedAt: row.nacked_at,
+      failedAt: row.failed_at,
+      nextRetryAt: row.next_retry_at,
+      lastError: row.last_error,
+    };
+
+    if (delivery.status === DELIVERY_STATUS.IN_FLIGHT) {
+      delivery.status = DELIVERY_STATUS.READY;
+      delivery.deliveredAt = null;
+      delivery.deliveredConnectionId = null;
+      delivery.deliveredTo = null;
+      delivery.nextRetryAt = null;
+      persistDelivery(delivery);
+    }
+
+    deliveries.set(delivery.id, delivery);
+    getQueueDeliveries(delivery.queue).push(delivery.id);
+  }
+}
+
+function hydrateDeadLetterDeliveries() {
+  const rows = all(`
+    SELECT
+      delivery_id,
+      message_id,
+      topic,
+      queue,
+      payload_json,
+      attempts,
+      last_error,
+      failed_at
+    FROM dead_letter_deliveries
+    ORDER BY failed_at ASC
+  `);
+
+  for (const row of rows) {
+    deadLetterDeliveries.set(row.delivery_id, {
+      delivery_id: row.delivery_id,
+      message_id: row.message_id,
+      topic: row.topic,
+      queue: row.queue,
+      payload: row.payload_json ? deserializePayload(row.payload_json) : null,
+      attempts: row.attempts,
+      last_error: row.last_error,
+      failed_at: row.failed_at,
+    });
+  }
+}
+
+function hydrateFromDatabase() {
+  hydrateMessages();
+  hydrateDeliveries();
+  hydrateDeadLetterDeliveries();
+}
+
+hydrateFromDatabase();
 
 module.exports = {
   DELIVERY_STATUS,

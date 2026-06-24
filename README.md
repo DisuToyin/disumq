@@ -4,6 +4,35 @@ Mini TCP message broker.
 
 Commands are newline-delimited JSON.
 
+## Persistence
+
+Broker state is persisted to SQLite at:
+
+```text
+data/disumq.sqlite
+```
+
+You can override the database path with:
+
+```bash
+DISUMQ_DB_PATH=/path/to/disumq.sqlite node src/server.js
+```
+
+The broker persists:
+
+- topics
+- queues
+- topic-to-queue bindings
+- messages
+- deliveries
+- dead letter deliveries
+
+Connected TCP consumers are not persisted. They are runtime state and must
+reconnect after a restart.
+
+On startup, stored `IN_FLIGHT` deliveries are recovered as `READY` because the
+old consumer connection no longer exists.
+
 ## Publish
 
 Connect as a producer first:
